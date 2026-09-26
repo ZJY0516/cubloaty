@@ -150,39 +150,34 @@ def extract_cubins_from_fatbin(fatbin_file, output_dir):
         return []
 
 
-_demangle_cache = {}
-
-
 def demangle_symbols(symbols):
     """Batch-demangle C++ symbol names with a single c++filt process
 
     Spawning one c++filt per symbol is prohibitively slow for large
-    libraries (tens of thousands of symbols), so all pending symbols are
-    piped through one process. Results are cached across calls.
+    libraries (tens of thousands of symbols), so all symbols are piped
+    through one process. Symbols that fail to demangle are kept as-is.
     """
-    pending = [s for s in symbols if s not in _demangle_cache]
-    if pending:
-        try:
-            result = subprocess.run(
-                ["c++filt"],
-                input="\n".join(pending),
-                capture_output=True,
-                text=True,
-                check=True,
-            )
-            demangled = result.stdout.splitlines()
-            if len(demangled) != len(pending):
-                raise ValueError(
-                    f"c++filt returned {len(demangled)} lines for {len(pending)} symbols"
-                )
-            for mangled, dem in zip(pending, demangled):
-                _demangle_cache[mangled] = dem if dem else mangled
-        except Exception as e:
-            # Symbol demangling failure is not critical, just keep originals
-            logger.debug(f"Failed to batch-demangle symbols: {e}")
-            for s in pending:
-                _demangle_cache[s] = s
-    return {s: _demangle_cache[s] for s in symbols}
+    symbols = list(symbols)
+    if not symbols:
+        return {}
+    try:
+        result = subprocess.run(
+            ["c++filt"],
+            input="\n".join(symbols),
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        demangled = result.stdout.splitlines()
+    except (subprocess.CalledProcessError, FileNotFoundError) as e:
+        logger.debug(f"Failed to batch-demangle symbols: {e}")
+        return {s: s for s in symbols}
+    if len(demangled) != len(symbols):
+        logger.debug(
+            f"c++filt returned {len(demangled)} lines for {len(symbols)} symbols"
+        )
+        return {s: s for s in symbols}
+    return dict(zip(symbols, demangled))
 
 
 def analyze_cubin_sizes(cubin_file):
