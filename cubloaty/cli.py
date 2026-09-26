@@ -161,8 +161,10 @@ def demangle_symbols(symbols):
     if not symbols:
         return {}
     try:
+        # Deeply nested CUTLASS templates exceed c++filt's default recursion
+        # limit and would come back still mangled (binutils >= 2.32)
         result = subprocess.run(
-            ["c++filt"],
+            ["c++filt", "--no-recurse-limit"],
             input="\n".join(symbols),
             capture_output=True,
             text=True,
@@ -267,8 +269,14 @@ def analyze_cubin_sizes(cubin_file):
             ["readelf", "-sW", cubin_file], capture_output=True, text=True, check=True
         )
 
-        # Parse readelf output to extract function names and sizes
+        # Parse readelf output to extract function names and sizes.
+        # Non-inlined device functions appear as LOCAL symbols named
+        # '$<kernel>$<callee>' (or '$__internal_N_$...') living in the
+        # kernel's own .text section; fold them into that section's kernel
+        # so they are neither counted as kernels nor lost from its size.
         mangled_sizes = {}
+        section_owner = {}
+        local_funcs = []
         for line in result.stdout.split("\n"):
             # Look for FUNC entries
             if "FUNC" in line:
@@ -277,13 +285,22 @@ def analyze_cubin_sizes(cubin_file):
                     try:
                         # The size is typically the 3rd field (index 2)
                         size = int(parts[2], 0)  # 0 base to auto-detect hex/dec
-                        # The symbol name is the last part
-                        name = parts[-1]
-                        if size > 0:  # Only include functions with non-zero size
-                            mangled_sizes[name] = size
-                    except (ValueError, IndexError):
+                    except ValueError:
                         # Skip malformed symbol entries
                         continue
+                    if size <= 0:  # Only include functions with non-zero size
+                        continue
+                    # Name is last; section index precedes it (cubins may
+                    # insert an extra '[<other>: 0x10]' field before Ndx)
+                    name, section = parts[-1], parts[-2]
+                    if name.startswith("$"):
+                        local_funcs.append((section, name, size))
+                    else:
+                        mangled_sizes[name] = size
+                        section_owner[section] = name
+        for section, name, size in local_funcs:
+            owner = section_owner.get(section, name)
+            mangled_sizes[owner] = mangled_sizes.get(owner, 0) + size
 
         # Demangle all symbols in a single c++filt invocation
         for mangled, demangled in demangle_symbols(mangled_sizes).items():
