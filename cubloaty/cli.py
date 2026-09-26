@@ -150,22 +150,39 @@ def extract_cubins_from_fatbin(fatbin_file, output_dir):
         return []
 
 
-def demangle_symbol(symbol):
-    """Demangle C++ symbol names
+_demangle_cache = {}
 
-    Uses c++filt to demangle C++ symbols. If demangling fails,
-    returns the original symbol name.
+
+def demangle_symbols(symbols):
+    """Batch-demangle C++ symbol names with a single c++filt process
+
+    Spawning one c++filt per symbol is prohibitively slow for large
+    libraries (tens of thousands of symbols), so all pending symbols are
+    piped through one process. Results are cached across calls.
     """
-    try:
-        result = subprocess.run(
-            ["c++filt", symbol], capture_output=True, text=True, check=True
-        )
-        demangled = result.stdout.strip()
-        return demangled if demangled else symbol
-    except Exception as e:
-        # Symbol demangling failure is not critical, just return original
-        logger.debug(f"Failed to demangle symbol {symbol}: {e}")
-        return symbol
+    pending = [s for s in symbols if s not in _demangle_cache]
+    if pending:
+        try:
+            result = subprocess.run(
+                ["c++filt"],
+                input="\n".join(pending),
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            demangled = result.stdout.splitlines()
+            if len(demangled) != len(pending):
+                raise ValueError(
+                    f"c++filt returned {len(demangled)} lines for {len(pending)} symbols"
+                )
+            for mangled, dem in zip(pending, demangled):
+                _demangle_cache[mangled] = dem if dem else mangled
+        except Exception as e:
+            # Symbol demangling failure is not critical, just keep originals
+            logger.debug(f"Failed to batch-demangle symbols: {e}")
+            for s in pending:
+                _demangle_cache[s] = s
+    return {s: _demangle_cache[s] for s in symbols}
 
 
 def analyze_cubin_sizes(cubin_file):
@@ -256,6 +273,7 @@ def analyze_cubin_sizes(cubin_file):
         )
 
         # Parse readelf output to extract function names and sizes
+        mangled_sizes = {}
         for line in result.stdout.split("\n"):
             # Look for FUNC entries
             if "FUNC" in line:
@@ -267,12 +285,14 @@ def analyze_cubin_sizes(cubin_file):
                         # The symbol name is the last part
                         name = parts[-1]
                         if size > 0:  # Only include functions with non-zero size
-                            # Demangle the symbol
-                            demangled = demangle_symbol(name)
-                            symbols[demangled] = size
+                            mangled_sizes[name] = size
                     except (ValueError, IndexError):
                         # Skip malformed symbol entries
                         continue
+
+        # Demangle all symbols in a single c++filt invocation
+        for mangled, demangled in demangle_symbols(mangled_sizes).items():
+            symbols[demangled] = mangled_sizes[mangled]
 
         # Add section breakdown as special entries
         # Use a special prefix to avoid Rich markup interpretation
@@ -312,29 +332,22 @@ def extract_sm_arch(cubin_name):
 
 
 def get_cubin_arch(cubin_file):
-    """Get architecture from cubin file using cuobjdump
+    """Get the true SM architecture of a cubin file
 
-    Tries to determine SM architecture using cuobjdump, falls back to
-    parsing the filename if cuobjdump is not available.
+    cuobjdump names extracted cubins without the family suffix (e.g. an
+    sm_100f cubin appears as '*.sm_100.cubin') and the ELF header flags
+    are identical, so the authoritative source is the ptxas command line
+    recorded in the cubin's comment section ('-arch sm_100f'). Falls back
+    to parsing the filename.
     """
     try:
-        result = subprocess.run(
-            ["cuobjdump", "-lelf", cubin_file],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        # Parse output like "ELF file    1: kernel.sm_90.cubin"
-        for line in result.stdout.split("\n"):
-            if "ELF file" in line and ".sm_" in line:
-                match = re.search(r"\.sm_(\d+[a-z]?)\.cubin", line)
-                if match:
-                    return f"sm_{match.group(1)}"
-        return "unknown"
-    except (subprocess.CalledProcessError, FileNotFoundError) as e:
-        # Fallback to filename-based detection
-        logger.debug(f"Could not get architecture from cuobjdump, using filename: {e}")
-        return extract_sm_arch(cubin_file)
+        with open(cubin_file, "rb") as f:
+            match = re.search(rb"-arch\s+(sm_\d+[a-z]?)[\s\x00]", f.read())
+        if match:
+            return match.group(1).decode()
+    except OSError as e:
+        logger.debug(f"Could not read cubin comment from {cubin_file}: {e}")
+    return extract_sm_arch(cubin_file)
 
 
 def shorten_kernel_name(name, max_length=80):
@@ -599,7 +612,7 @@ Examples:
                         # Group by architecture
                         arch_groups = defaultdict(list)
                         for cubin_name, cubin_path in extracted_cubins:
-                            arch = extract_sm_arch(cubin_name)
+                            arch = get_cubin_arch(cubin_path)
                             arch_groups[arch].append((cubin_name, cubin_path))
 
                         for arch in sorted(arch_groups.keys()):
